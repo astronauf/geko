@@ -111,11 +111,15 @@ def contiuum_subtraction(grism_spectrum_data, min, max):
 
     return grism_spectrum_data
 
-def prep_grism(grism_spectrum,grism_spectrum_error, wavelength, delta_wave_cutoff = 0.02, wave_first = 3.5, d_wave = 0.001):
+def prep_grism(grism_spectrum, grism_spectrum_error, wavelength, delta_wave_cutoff = 0.02, wave_first = 3.5, d_wave = 0.001):
     '''
         Crop the grism spectrum to a smaller size, centered on the wavelength of interest
         Remove the continuum
     '''
+    # Handle big-endian float64
+    grism_spectrum = np.asarray(grism_spectrum, dtype=np.float64)
+    grism_spectrum_error = np.asarray(grism_spectrum_error, dtype=np.float64)
+
     #choose which wavelengths will be the cutoff of the EL map and save those
     wave_min = wavelength - delta_wave_cutoff 
     wave_max = wavelength + delta_wave_cutoff 
