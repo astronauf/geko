@@ -53,6 +53,22 @@ from astropy.cosmology import Planck18 as cosmo
 # setup.configure_plots()
 
 
+_INIT_STRATEGIES = {
+    'median': lambda: init_to_median(num_samples=2000),
+    'uniform': lambda: init_to_uniform(radius=2),
+    'sample': lambda: init_to_sample(),
+}
+
+
+def make_init_strategy(name):
+    """Map an MCMCSettings.init_strategy name to a numpyro init function."""
+    try:
+        return _INIT_STRATEGIES[name]()
+    except KeyError:
+        raise ValueError(f"Unknown init_strategy {name!r}; choose from {sorted(_INIT_STRATEGIES)}") from None
+
+
+
 class Fit_Numpyro():
     def __init__(self, obs_map, obs_error, grism_object, kin_model, inference_data, parametric, config=None):
         """ Class to fit model to data
@@ -157,17 +173,23 @@ class Fit_Numpyro():
             inference_model = self.kin_model.inference_model_parametric
         else:
             inference_model = self.kin_model.inference_model
-        self.nuts_kernel = NUTS(inference_model,  step_size=step_size, adapt_step_size=adapt_step_size, init_strategy=init_to_median(num_samples=2000),
-                                target_accept_prob=target_accept_prob, find_heuristic_step_size=True, max_tree_depth=max_tree_depth, dense_mass=False, adapt_mass_matrix=True) 
+        # init_vals (unscaled_-site values) lets a caller seed the chain at a
+        # specific point instead of the default init_to_median -- e.g. to test
+        # whether an alternate local mode (opposite-sign Va) is real. None
+        # (the default for every existing caller) keeps today's behavior exactly.
+        init_strategy = init_to_value(values=init_vals) if init_vals is not None else make_init_strategy(mcmc_config.init_strategy)
+        self.nuts_kernel = NUTS(inference_model,  step_size=step_size, adapt_step_size=adapt_step_size, init_strategy=init_strategy,
+                                target_accept_prob=target_accept_prob, find_heuristic_step_size=True, max_tree_depth=max_tree_depth, dense_mass=False, adapt_mass_matrix=True)
         
-        print(f'MCMC settings: {num_chains} chains, {num_samples} samples, {num_warmup} warmup, max_tree_depth={max_tree_depth}, target_accept={target_accept_prob}')
+        print(f'MCMC settings: {num_chains} chains ({mcmc_config.chain_method}, init={mcmc_config.init_strategy}), {num_samples} samples, {num_warmup} warmup, max_tree_depth={max_tree_depth}, target_accept={target_accept_prob}')
         print('step size: ', step_size)
         print('warmup: ', num_warmup)
         print('samples: ', num_samples)
 
 
         self.mcmc = MCMC(self.nuts_kernel, num_samples=num_samples,
-                         num_warmup=num_warmup, num_chains=num_chains)
+                         num_warmup=num_warmup, num_chains=num_chains,
+                         chain_method=mcmc_config.chain_method)
         self.rng_key = random.PRNGKey(100)
 
         # Use provided mask if given, otherwise create one using photutils segmentation
@@ -272,7 +294,7 @@ class Fit_Numpyro():
             inference_model,
             step_size=step_size,
             adapt_step_size=adapt_step_size,
-            init_strategy=init_to_median(num_samples=2000),
+            init_strategy=make_init_strategy(mcmc_config.init_strategy),
             target_accept_prob=target_accept_prob,
             find_heuristic_step_size=True,
             max_tree_depth=max_tree_depth,
@@ -286,13 +308,14 @@ class Fit_Numpyro():
         print(f'Number of observations: {len(observations)}')
         for obs in observations:
             print(f'  - {obs}')
-        print(f'MCMC settings: {num_chains} chains, {num_samples} samples, {num_warmup} warmup')
+        print(f'MCMC settings: {num_chains} chains ({mcmc_config.chain_method}, init={mcmc_config.init_strategy}), {num_samples} samples, {num_warmup} warmup')
         print(f'               max_tree_depth={max_tree_depth}, target_accept={target_accept_prob}')
         print(f'{"="*60}\n')
 
         # Setup and run MCMC
         self.mcmc = MCMC(self.nuts_kernel, num_samples=num_samples,
-                        num_warmup=num_warmup, num_chains=num_chains)
+                        num_warmup=num_warmup, num_chains=num_chains,
+                        chain_method=mcmc_config.chain_method)
         self.rng_key = random.PRNGKey(100)
 
         # Run MCMC (observations and masks are captured in the closure)
@@ -430,7 +453,16 @@ class Fit_Numpyro():
 
         segment_map = detect_sources(im_conv, sigma_rms*np.abs(bkg.background_median), npixels=10)
 
+        # Fall back to fitting the full cutout when segmentation finds nothing, or when
+        # the central pixel is background (label 0, which would otherwise select every
+        # background pixel instead of the source)
+        if segment_map is None:
+            print('WARNING: create_mask found no sources in the grism spectrum; using the full cutout as mask')
+            return np.ones(self.obs_map.shape)
         main_label = segment_map.data[int(0.5*self.obs_map.shape[0]), int(0.5*self.obs_map.shape[1])]
+        if main_label == 0:
+            print('WARNING: create_mask found no source at the central pixel; using the full cutout as mask')
+            return np.ones(self.obs_map.shape)
 
         # construct mask
         mask = segment_map.data
@@ -751,6 +783,9 @@ def run_geko_fit_multi(observations_config, output, master_cat, line, parametric
             - 'theta_rot': float, rotation angle in degrees (for morphology alignment)
             - 'dispersion': str, 'R' (row) or 'C' (column) dispersion direction
             - 'name': str, optional name for this observation (default: 'obsN')
+            - 'psf_name': str, optional PSF filename in save_runs_path/psfs/ for this
+              observation (default: manual_psf_name). A PSF whose PIXELSCL equals the
+              model scale (0.0629"/factor) is used as-is; otherwise it is resampled.
         Example:
             [
                 {'grism_file': 'spec_2d_PA0.fits', 'theta_rot': 0.0, 'dispersion': 'R', 'name': 'PA0'},
@@ -830,7 +865,7 @@ def run_geko_fit_multi(observations_config, output, master_cat, line, parametric
             factor=factor,
             wave_factor=wave_factor,
             model_name=model_name,
-            manual_psf_name=manual_psf_name,
+            manual_psf_name=observations_config[0].get('psf_name', manual_psf_name),
             manual_grism_file=first_obs_file
         )
 
@@ -960,7 +995,7 @@ def run_geko_fit_multi(observations_config, output, master_cat, line, parametric
                 factor=factor,
                 wave_factor=wave_factor,
                 model_name=model_name,
-                manual_psf_name=manual_psf_name,
+                manual_psf_name=obs_config.get('psf_name', manual_psf_name),
                 manual_grism_file=grism_file
             )
 
@@ -1032,7 +1067,7 @@ def run_geko_fit_multi(observations_config, output, master_cat, line, parametric
     summary, kin_model, inf_data = post.process_results_multi(
         observations, results, output, master_cat, line, parametric, source_id, save_runs_path,
         field, grism_filter, delta_wave_cutoff, factor, wave_factor, model_name,
-        manual_psf_name=manual_psf_name, manual_grism_file=observations_config[0]['grism_file'])
+        manual_psf_name=observations_config[0].get('psf_name', manual_psf_name), manual_grism_file=observations_config[0]['grism_file'])
 
     print("\nMulti-observation fitting complete!")
     for name, stats in summary.items():
@@ -1071,7 +1106,7 @@ def postprocess_geko_fit_multi(observations_config, output, master_cat, line, pa
             factor=factor,
             wave_factor=wave_factor,
             model_name=model_name,
-            manual_psf_name=manual_psf_name,
+            manual_psf_name=observations_config[0].get('psf_name', manual_psf_name),
             manual_grism_file=first_obs_file
         )
 
@@ -1182,7 +1217,7 @@ def postprocess_geko_fit_multi(observations_config, output, master_cat, line, pa
                 factor=factor,
                 wave_factor=wave_factor,
                 model_name=model_name,
-                manual_psf_name=manual_psf_name,
+                manual_psf_name=obs_config.get('psf_name', manual_psf_name),
                 manual_grism_file=grism_file
             )
 
@@ -1208,7 +1243,7 @@ def postprocess_geko_fit_multi(observations_config, output, master_cat, line, pa
     summary, kin_model, inf_data = post.process_results_multi(
         observations, results, output, master_cat, line, parametric, source_id, save_runs_path,
         field, grism_filter, delta_wave_cutoff, factor, wave_factor, model_name,
-        manual_psf_name=manual_psf_name, manual_grism_file=observations_config[0]['grism_file'])
+        manual_psf_name=observations_config[0].get('psf_name', manual_psf_name), manual_grism_file=observations_config[0]['grism_file'])
 
     print("\nPost-processing complete!")
     for name, stats in summary.items():

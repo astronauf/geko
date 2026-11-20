@@ -8,7 +8,7 @@
 __all__ = ['oversample', 'resample', 'scale_distribution', 'find_best_sample', 'compute_gal_props',
            'load_psf', 'compute_inclination', 'compute_axis_ratio', 'add_v_re', 'sersic_profile',
            'compute_adaptive_sersic_profile', 'flux_to_Ie', 'Ie_to_flux', 'rotate_coords',
-           'rotate_and_upsample_scale']
+           'rotate_and_upsample_scale', 'resample_psf_centered', 'read_psf_pixel_scale']
            
 # geko imports
 
@@ -31,7 +31,7 @@ from jax.scipy.special import gamma
 
 from astropy.modeling.models import Sersic2D
 from scipy import stats
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, map_coordinates
 from photutils.segmentation import detect_sources, SourceCatalog, deblend_sources, SegmentationImage
 from photutils.background import Background2D, MedianBackground
 from photutils.aperture import EllipticalAperture
@@ -54,6 +54,7 @@ from scipy import stats as st
 from . import  models
 
 import os
+import warnings
 
 from pathlib import Path
 
@@ -401,39 +402,113 @@ def save_fits_image(image, masked_indices, inference_data, filename):
 
     hdul.writeto(filename, overwrite=True)
     
-def downsample_psf_centered(psf_full, size):
-    """
-    Crop a PSF around its centre and downsample from 0.031 to 0.063 arcsec/px.
+# Pixel scale of the legacy mpsf_*.fits empirical PSFs (2x the LW detector
+# sampling), used only by load_psf/downsample_psf_centered. The fitting path
+# reads the scale from the PSF header and raises an error if it is missing.
+DEFAULT_PSF_PIXEL_SCALE_ARCSEC = 0.031
 
-    The input PSF is at 2× detector oversampling (0.031 arcsec/px). The output
-    is at detector scale (0.063 arcsec/px), ready for compute_PSF which then
-    upsamples to model resolution.
+
+def read_psf_pixel_scale(*headers):
+    """
+    Pixel scale (arcsec/px) of a PSF from its FITS header(s), or None.
+
+    Looks for PIXELSCL (written by WebbPSF/STPSF) or PIXSCALE in each header
+    in turn and returns the first one found.
+    """
+    for header in headers:
+        if header is None:
+            continue
+        for key in ('PIXELSCL', 'PIXSCALE'):
+            if key in header:
+                return float(header[key])
+    return None
+
+
+def resample_psf_centered(psf, psf_scale_arcsec, out_scale_arcsec, out_size):
+    """
+    Resample a PSF of any (odd) size and pixel scale onto an odd-sized grid at
+    a different pixel scale, keeping the PSF centre fixed on the central pixel.
+
+    The input's central pixel ((n-1)/2, n odd) maps exactly onto the output's
+    central pixel ((out_size-1)/2), and each output pixel takes the bilinearly
+    interpolated input value at its centre, so any scale ratio -- integer or
+    not, up or down -- is handled. No extra pixel integration is applied: an
+    empirical PSF already includes the detector pixel response, and the grism
+    model bins its oversampled cube to detector pixels itself. Regions of the
+    output grid not covered by the input are zero-padded (with a warning).
 
     Parameters
     ----------
-    psf_full : numpy.ndarray
-        Full PSF array at 0.031 arcsec/px (e.g. 669×669).
-    size : int
-        Half-width of the crop in input pixels; crop is (2*size+1, 2*size+1).
-        Output shape is approximately (size, size) after 2× downsampling.
+    psf : array_like
+        Square 2D PSF with an odd number of pixels per side, centred on its
+        central pixel.
+    psf_scale_arcsec : float
+        Pixel scale of the input PSF, in arcsec/px.
+    out_scale_arcsec : float
+        Pixel scale of the output grid, in arcsec/px.
+    out_size : int
+        Number of output pixels per side (must be odd).
 
     Returns
     -------
     numpy.ndarray
-        PSF at detector scale (0.063 arcsec/px), shape ≈ (size, size).
+        (out_size, out_size) PSF at out_scale_arcsec, normalized to sum to 1.
     """
-    cy, cx = psf_full.shape[0] // 2, psf_full.shape[1] // 2
-    psf_crop = np.array(psf_full[cy - size:cy + size + 1,
-                                  cx - size:cx + size + 1])
-    # Target an odd output so there is an exact central pixel.
-    # size/(2*size+1) maps the input centre exactly to the output centre.
+    psf = np.asarray(psf, dtype=float)
+    if psf.ndim != 2 or psf.shape[0] != psf.shape[1]:
+        raise ValueError(f"PSF must be a square 2D array, got shape {psf.shape}.")
+    if psf.shape[0] % 2 == 0:
+        raise ValueError(
+            f"PSF must have an odd number of pixels per side so its centre is a "
+            f"pixel centre, got shape {psf.shape}.")
+    if out_size % 2 == 0:
+        raise ValueError(f"out_size must be odd, got {out_size}.")
+
+    c_in = (psf.shape[0] - 1) / 2
+    peak = np.unravel_index(np.argmax(psf), psf.shape)
+    if max(abs(peak[0] - c_in), abs(peak[1] - c_in)) > 1:
+        warnings.warn(
+            f"PSF peak is at pixel {peak}, more than 1 px from the array centre "
+            f"({c_in:.0f}, {c_in:.0f}); the array centre is used as the PSF centre.")
+
+    ratio = out_scale_arcsec / psf_scale_arcsec  # input px per output px
+    c_out = (out_size - 1) / 2
+    if (c_out + 0.5) * ratio > c_in + 0.5:
+        warnings.warn(
+            f"PSF ({psf.shape[0]} px at {psf_scale_arcsec}\"/px) does not cover the "
+            f"requested output ({out_size} px at {out_scale_arcsec}\"/px); "
+            f"zero-padding the outskirts.")
+
+    offsets = (np.arange(out_size) - c_out) * ratio
+    yy, xx = np.meshgrid(c_in + offsets, c_in + offsets, indexing='ij')
+    out = map_coordinates(psf, [yy, xx], order=1, mode='constant', cval=0.0)
+    return out / out.sum()
+
+
+def downsample_psf_centered(psf_full, size):
+    """
+    Resample a PSF at DEFAULT_PSF_PIXEL_SCALE_ARCSEC (0.031 arcsec/px) to the
+    grism detector scale (0.0629 arcsec/px), keeping its centre fixed.
+
+    Thin wrapper around resample_psf_centered, kept for existing callers.
+
+    Parameters
+    ----------
+    psf_full : numpy.ndarray
+        Full PSF array at 0.031 arcsec/px (e.g. 669×669, odd).
+    size : int
+        Output size in detector pixels (rounded down to odd).
+
+    Returns
+    -------
+    numpy.ndarray
+        PSF at detector scale, shape (size, size) (or size-1 if size is even),
+        normalized to sum to 1.
+    """
+    from .wcs_utils import GRISM_PIXEL_SCALE_ARCSEC
     out_size = size if size % 2 == 1 else size - 1
-    # skimage.transform.resize uses pixel-centre coordinates (same convention as
-    # jax.image.resize used in compute_PSF), so the PSF peak maps exactly to the
-    # central output pixel. scipy.ndimage.zoom uses pixel-boundary coordinates and
-    # shifts the peak by ~0.3 px for this zoom factor.
-    return sk_resize(psf_crop, (out_size, out_size), order=1,
-                     anti_aliasing=False, preserve_range=True)
+    return resample_psf_centered(psf_full, DEFAULT_PSF_PIXEL_SCALE_ARCSEC,
+                                 GRISM_PIXEL_SCALE_ARCSEC, out_size)
 
 def load_psf( filter, y_factor, size = 9, psf_folder = 'mpsf_gds/'):
     """
@@ -709,8 +784,8 @@ def compute_MAP(inf_data, grism_object, image):
 
     image_shape = 31
     print(image_shape//2)
-    x = jnp.linspace(0 - image_shape//2, image_shape - image_shape//2 - 1, image_shape*factor)
-    y = jnp.linspace(0 - image_shape//2, image_shape - image_shape//2 - 1, image_shape*factor)
+    x = subpixel_grid(image_shape, factor, image_shape//2)
+    y = subpixel_grid(image_shape, factor, image_shape//2)
     x,y = jnp.meshgrid(x,y)
     kin_model = models.KinModels()
     # kin_model.compute_factors(jnp.radians((PA_map)), jnp.radians(inc_map), x,y)
@@ -826,6 +901,142 @@ def sersic_profile(x,y,amplitude, r_eff , n , x_0 , y_0 , ellip , theta, c=0):
     z = jnp.where(((x_maj>0) | (x_min>0)) & (b_safe!=0) & (r_eff>0), jnp.where(squared>0,jnp.sqrt(squared), 0.0), 1e-5)
         
     return jnp.where((n_safe>0) & ((x_maj>0) | (x_min>0)) & (b_safe!=0) & (r_eff>0), amplitude * jnp.exp(-bn * (z ** (1 / n_safe) - 1.0)), amplitude * jnp.exp(bn))
+
+
+def subpixel_grid(image_shape, factor, center):
+    """
+    Coordinates of the model (sub)pixel centres along one axis, relative to `center`,
+    in native pixel units: native pixel i (centre at i) is split into `factor`
+    subpixels centred at i + (k + 0.5)/factor - 0.5, k = 0..factor-1.
+
+    (jnp.linspace(-center, image_shape - 1 - center, image_shape*factor), used
+    before, spaces the points by (N-1)/(N*factor-1) instead of 1/factor, i.e.
+    stretches the model by ~2.6% per axis for N=31, factor=5.)
+    """
+    return (jnp.arange(image_shape * factor) + 0.5) / factor - 0.5 - center
+
+
+# --- Sersic profile as a mixture of Gaussians (Shajib 2019, as in PySersic) ------
+# A Sersic profile is decomposed into Gaussians with fixed widths (log-spaced in
+# units of r_eff) and n-dependent amplitudes, from a numerical inverse transform
+# (Euler's method). Each Gaussian can then be integrated over a pixel and has
+# smooth derivatives everywhere, unlike a point-sampled cuspy profile at high n.
+# The Sersic index prior is bounded below at SERSIC_N_MIN = 0.65, as in PySersic
+# (the decomposition needs n > 0.5 and gets increasingly hard to resolve towards it).
+SERSIC_N_MIN = 0.65
+
+def _shajib_euler_coefficients(p=10):
+    from math import comb
+    k = np.arange(2 * p + 1)
+    betas = np.sqrt(2 * p * np.log(10) / 3 + 2j * np.pi * k)
+    eps = np.zeros(2 * p + 1)
+    eps[0] = 0.5; eps[1:p + 1] = 1.0; eps[-1] = 1.0 / 2**p
+    for kk in range(1, p):
+        eps[2 * p - kk] = eps[2 * p - kk + 1] + comb(p, kk) / 2**p
+    etas = (-1.0)**k * eps * 10**(p / 3) * 2 * np.sqrt(2 * np.pi)
+    return etas, betas
+
+_MOG_ETAS, _MOG_BETAS = _shajib_euler_coefficients(10)
+# 60 widths over 1e-3..15 r_eff: for n < ~1 the weights are sharply peaked in log(sigma),
+# and PySersic's 15 components over 1e-2..15 mis-represent them (10% flux error at
+# n=0.65). With 60 the enclosed flux is within 0.2% and the profile within 0.5%
+# (0.05-3 r_eff) of the analytic Sersic for 0.65 <= n <= 8.
+_MOG_SIGMAS = np.logspace(-3, np.log10(15.0), 60)   # Gaussian widths, units of r_eff
+
+
+def sersic_mog_components(n):
+    """
+    Gaussian decomposition of a circular, unit-flux Sersic profile with r_eff = 1
+    (same b_n as sersic_profile / flux_to_Ie). Returns (fluxes, sigmas): the flux of
+    each Gaussian and its width in units of r_eff. Sum of fluxes ~ 1.
+    """
+    n = jnp.maximum(n, SERSIC_N_MIN)
+    s = jnp.asarray(_MOG_SIGMAS)
+    bn = bn_approx(n)
+    Ie = 1.0 / (2 * jnp.pi * n * jnp.exp(bn) * bn**(-2 * n) * gamma(2 * n))
+    r = s[:, None] * jnp.asarray(_MOG_BETAS)[None, :]                  # complex radii
+    prof = Ie * jnp.exp(-bn * (r**(1.0 / n) - 1.0))
+    f = jnp.sum(jnp.asarray(_MOG_ETAS) * prof, axis=1).real
+    dlns = np.log(_MOG_SIGMAS[1] / _MOG_SIGMAS[0])
+    amp = f * dlns / np.sqrt(2 * np.pi)
+    amp = amp.at[0].multiply(0.5).at[-1].multiply(0.5)                  # trapezoid ends
+    return amp * 2 * jnp.pi * s**2, s
+
+
+def sersic_image(image_shape, factor, flux, r_eff, n, xc, yc, ellip, theta):
+    """
+    Pixel-integrated elliptical Sersic image on the model grid, as a mixture of
+    Gaussians (sersic_mog_components).
+
+    Parameters
+    ----------
+    image_shape : int
+        Native image size N (the model grid is N*factor on a side).
+    factor : int
+        Oversampling factor of the model grid.
+    flux : float
+        Total flux.
+    r_eff, n : float
+        Effective radius along the major axis (native px) and Sersic index
+        (clipped at SERSIC_N_MIN).
+    xc, yc : float
+        Centre in native pixel coordinates (pixel i centred at i).
+    ellip : float
+        Ellipticity 1 - q.
+    theta : float
+        Major-axis angle in radians, as in sersic_profile ((90 - PA) * pi/180).
+
+    Returns
+    -------
+    (N*factor, N*factor) array of flux per model pixel.
+
+    Notes
+    -----
+    Each Gaussian is integrated over the model pixels (size d = 1/factor) in one of
+    two ways, blended smoothly per component by its major-axis width s_a:
+    - point-like components (s_a <~ d/2, the core of high-n profiles) are
+      integrated exactly over each pixel (erf) as round Gaussians with the same
+      mean variance, floored at (0.3 d)^2 so the image varies smoothly with the
+      centre position: exact flux and centroid, and their shape below ~0.1 native
+      px is irrelevant after the PSF;
+    - the others are evaluated at the pixel centres with the pixel variance d^2/12
+      added along both axes. Their variance along each axis is floored smoothly at
+      (0.7 d)^2, so the thin minor axis of flattened components is never
+      undersampled (which would make the flux depend on the sub-pixel position of
+      the centre; residual aliasing ~1e-5).
+    Against an exact (finely sampled) rendering, after a ~2.2 px FWHM PSF the error
+    is <~0.5% of the peak for r_eff >~ 1 px and q >~ 0.6, up to ~2% for edge-on
+    (q = 0.2) high-n profiles and ~3% for unresolved (r_eff ~ 0.3 px) edge-on ones.
+    """
+    gx = subpixel_grid(image_shape, factor, xc)
+    gy = subpixel_grid(image_shape, factor, yc)
+    X, Y = jnp.meshgrid(gx, gy)
+    c, s = jnp.cos(theta), jnp.sin(theta)
+    x_maj = X * c + Y * s
+    x_min = -X * s + Y * c
+    q = 1.0 - ellip
+    d = 1.0 / factor
+    fl, sig = sersic_mog_components(n)
+    sig_a = sig * r_eff
+    sig_b = q * sig_a
+    w_pt = 1.0 / (1.0 + (sig_a / (0.5 * d))**4)            # weight of the exact point-like rendering
+
+    # sampled at pixel centres, pixel variance added, variance floored at (0.7 d)^2
+    floor4 = (0.7 * d)**4
+    soft_floor = lambda v: jnp.sqrt(v**2 + floor4)
+    sa2 = soft_floor(sig_a**2 + d**2 / 12.0)
+    sb2 = soft_floor(sig_b**2 + d**2 / 12.0)
+    norm = (fl * (1.0 - w_pt) * d**2 / (2 * jnp.pi * jnp.sqrt(sa2 * sb2)))[:, None, None]
+    img = jnp.sum(norm * jnp.exp(-0.5 * (x_maj[None]**2 / sa2[:, None, None] + x_min[None]**2 / sb2[:, None, None])), axis=0)
+
+    # point-like: exact pixel integral of round Gaussians (separable erf)
+    # sqrt(2) * rms width of the two axes, floored at 0.3 d so the response to the
+    # centre position has no kinks at pixel boundaries (smooth gradients for HMC)
+    sig_c = jnp.sqrt(sig_a**2 + sig_b**2 + 2 * (0.3 * d)**2)[:, None]
+    ex = jnp.diff(0.5 * jax.scipy.special.erf(jnp.concatenate([gx - d / 2, gx[-1:] + d / 2])[None, :] / sig_c), axis=1)
+    ey = jnp.diff(0.5 * jax.scipy.special.erf(jnp.concatenate([gy - d / 2, gy[-1:] + d / 2])[None, :] / sig_c), axis=1)
+    img = img + jnp.einsum('k,ki,kj->ij', fl * w_pt, ey, ex)
+    return flux * img
 
 @jax.jit
 def compute_adaptive_sersic_profile(x, y,intensity , r_eff, n, x0, y0, ellip, PA_sersic):

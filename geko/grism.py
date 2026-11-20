@@ -54,6 +54,34 @@ import jax
 # STANDALONE JIT-COMPILED FUNCTIONS (extracted from Grism class methods)
 # ============================================================================
 
+def _next_fast_len(n):
+	"""Smallest m >= n whose only prime factors are 2, 3 and 5 (fast FFT size)."""
+	m = n
+	while True:
+		k = m
+		for p in (2, 3, 5):
+			while k % p == 0:
+				k //= p
+		if k == 1:
+			return m
+		m += 1
+
+def _spatial_fftconvolve_same(cube, psf_2d):
+	"""
+	Convolve each wavelength slice of cube (y, x, lambda) with psf_2d (ky, kx),
+	'same' mode. Equivalent to fftconvolve(cube, psf_2d[:,:,None], mode='same')
+	but FFTs only the two spatial axes (the kernel has length 1 along lambda) and
+	pads them to 2/3/5-smooth lengths: jax's fftconvolve uses the raw full size
+	(often prime, e.g. 155+75-1=229), which is much slower.
+	"""
+	ny, nx = cube.shape[0], cube.shape[1]
+	ky, kx = psf_2d.shape
+	fs = (_next_fast_len(ny + ky - 1), _next_fast_len(nx + kx - 1))
+	spec = jnp.fft.rfft2(cube, s=fs, axes=(0, 1)) * jnp.fft.rfft2(psf_2d, s=fs)[:, :, jnp.newaxis]
+	full = jnp.fft.irfft2(spec, s=fs, axes=(0, 1))
+	y0, x0 = (ky - 1)//2, (kx - 1)//2
+	return full[y0:y0 + ny, x0:x0 + nx]
+
 @jax.jit
 def _disperse_gaussian_core(F, wave_centers, wave_sigmas_eff, wave_space_edges):
 	"""
@@ -148,7 +176,7 @@ class Grism:
 	factor : int
 		Oversampling factor between model and detector
 	"""
-	def __init__(self, im_shape, im_scale = 0.031, icenter = 5, jcenter = 5, wavelength = 4.2 , wave_space = None, index_min = None, index_max = None, grism_filter = 'F444W', grism_module = 'A', grism_pupil = 'R', PSF = None):
+	def __init__(self, im_shape, im_scale = 0.031, icenter = 5, jcenter = 5, wavelength = 4.2 , wave_space = None, index_min = None, index_max = None, grism_filter = 'F444W', grism_module = 'A', grism_pupil = 'R', PSF = None, psf_oversampled = False):
 
 		# Validate pupil parameter
 		if grism_pupil not in ['R', 'C']:
@@ -159,6 +187,7 @@ class Grism:
 
 		self.im_shape = im_shape #used to be self.im_shape
 		self.im_scale = im_scale #used to be self.direct_scale
+		self.psf_oversampled = psf_oversampled #True if PSF is given at model resolution (see compute_PSF)
 
 		self.set_detector_scale(0.0629) #setting to JWST resolution but made it a function so that it's easy to change as the outside user
 
@@ -252,22 +281,17 @@ class Grism:
 		self.detector_xmin = self.xcenter_detector - self.jcenter
 		self.detector_xmax = self.xcenter_detector + (self.im_shape//self.factor-1-self.jcenter)
 
-		detector_x_space_low = jnp.linspace(self.detector_xmin, self.detector_xmax, int(self.im_shape//self.factor))
-		detector_x_space_low_2d = jnp.reshape(detector_x_space_low, (1, int(self.im_shape//self.factor)))
-
-		# Oversample to high resolution
-		self.detector_space_1d_x = image.resize(detector_x_space_low_2d, (1, self.im_shape), method='linear')[0]
+		# detector coordinate of each model (sub)pixel centre; image.resize clamped the
+		# outer half detector pixel to the edge pixel's centre
+		self.detector_space_1d_x = self.detector_xmin + (jnp.arange(self.im_shape) + 0.5)/self.factor - 0.5
 		self.detector_space_2d_x = self.detector_space_1d_x * jnp.ones_like(jnp.zeros((self.im_shape, 1)))
 
 		# Y-coordinates (for column dispersion)
 		self.detector_ymin = self.ycenter_detector - self.icenter
 		self.detector_ymax = self.ycenter_detector + (self.im_shape//self.factor-1-self.icenter)
 
-		detector_y_space_low = jnp.linspace(self.detector_ymin, self.detector_ymax, int(self.im_shape//self.factor))
-		detector_y_space_low_2d = jnp.reshape(detector_y_space_low, (int(self.im_shape//self.factor), 1))
-
-		# Oversample to high resolution
-		self.detector_space_1d_y = image.resize(detector_y_space_low_2d, (self.im_shape, 1), method='linear')[:, 0]
+		# detector coordinate of each model (sub)pixel centre
+		self.detector_space_1d_y = self.detector_ymin + (jnp.arange(self.im_shape) + 0.5)/self.factor - 0.5
 		self.detector_space_2d_y = self.detector_space_1d_y[:, jnp.newaxis] * jnp.ones_like(jnp.zeros((1, self.im_shape)))
 
 		# Backward compatibility aliases
@@ -441,11 +465,86 @@ class Grism:
 			y_offset = (self.detector_space_1d_y - self.ycenter_detector)[:, jnp.newaxis]
 			dispersion_indices += y_offset
 
-		# Use nearest-neighbor lookup (Nov 2024 method)
-		# For each dispersion offset, find the closest in the uniformly distributed dxs
-		wave_indices = np.argmin(np.abs(self.dxs[np.newaxis,np.newaxis,:] - dispersion_indices[:,:,np.newaxis]), axis = 2)
-		# Translate this to a wavelength in the rest frame of the central pixel
-		self.wave_array = self.wavs[wave_indices]
+		# Translate each detector offset to a wavelength in the rest frame of the central
+		# pixel with the (linear) inverse dispersion spline. This is continuous: the
+		# previous nearest-neighbour lookup on self.dxs snapped every pixel to a whole
+		# wavelength bin (steps of 1 or 2 bins instead of the true ~1.77 per model px),
+		# misplacing its light by up to +-0.5 bin.
+		disp_idx = np.asarray(dispersion_indices)
+		self.wave_array = jnp.reshape(self.inverse_wave_disp(jnp.asarray(disp_idx.ravel())), disp_idx.shape)
+
+		self._set_dispersed_psf()
+
+	def _set_dispersed_psf(self):
+		"""
+		Build the PSF kernel for the collapsed (cross-dispersion, wavelength) image.
+
+		Light the PSF moves by dx model pixels along the dispersion axis lands where
+		light dispersed from dx pixels further along would land, i.e. a*dx wavelength
+		bins away, where a is the local slope of the trace (wave_array) in bins per
+		model pixel. So the PSF's dispersion axis is re-gridded onto wavelength bins
+		(column dx -> offset a*dx, split linearly between the two nearest bins) and its
+		cross-dispersion axis is kept. Convolving the collapsed image with this kernel
+		equals applying the PSF to every wavelength slice of the cube before
+		dispersing, as long as the trace is linear over the PSF footprint (it is to
+		<<1 bin for NIRCam). The slope is measured around the reference pixel.
+
+		Sets attributes dispersed_PSF (rows along the cross-dispersion axis, columns
+		in wavelength bins), dispersion_slope (a) and sigma_inst_kms (instrumental
+		line width, see _instrumental_sigma_kms).
+		"""
+		if not hasattr(self, 'wave_array') or not hasattr(self, 'oversampled_PSF'):
+			return
+		psf = np.asarray(self.oversampled_PSF)
+		wave = np.asarray(self.wave_array)
+		if self.pupil == 'R':
+			psf_o = psf                     # rows = y (cross), cols = x (dispersion)
+			pos = np.asarray(self.detector_space_1d_x) - self.xcenter_detector
+			trace = wave[wave.shape[0]//2, :]
+		else:
+			psf_o = psf.T                   # rows = x (cross), cols = y (dispersion)
+			pos = np.asarray(self.detector_space_1d_y) - self.ycenter_detector
+			trace = wave[:, wave.shape[1]//2]
+		k_cross, k_disp = psf_o.shape
+		c = (k_disp - 1)//2
+		# local slope of the trace (bins per model px), least squares over the PSF footprint
+		i0 = int(np.argmin(np.abs(pos)))
+		sl = slice(max(i0 - c, 0), min(i0 + c + 1, trace.size))
+		idx = np.arange(trace.size)[sl]
+		a = np.polyfit(idx, trace[sl]/float(self.wave_scale), 1)[0] if idx.size > 1 else 0.0
+		self.dispersion_slope = float(a)
+		H = int(np.ceil(abs(a)*c)) + 1
+		G = np.zeros((k_cross, 2*H + 1))
+		for j in range(k_disp):
+			d = H + a*(j - c)
+			lo = int(np.floor(d)); f = d - lo
+			G[:, lo] += psf_o[:, j]*(1 - f)
+			if f > 0:
+				G[:, lo + 1] += psf_o[:, j]*f
+		self.dispersed_PSF = jnp.asarray(G)
+		self.sigma_inst_kms = self._instrumental_sigma_kms(G.sum(axis=0), abs(a) * self.factor)
+
+	def _instrumental_sigma_kms(self, line_profile, pixel_bins):
+		"""
+		Instrumental line width (km/s) of this observation: the point-source line
+		profile (dispersed PSF summed over the cross-dispersion axis) convolved with
+		one detector pixel (pixel_bins wavelength bins wide), expressed as a Gaussian
+		sigma, FWHM/2.355. The FWHM measures the core; the PSF wings would dominate
+		an rms width. It depends on the line's wavelength (PSF size, dispersion),
+		filter, module and the PSF's profile along the dispersion axis.
+		"""
+		half_w = 0.5 * pixel_bins
+		n = int(np.ceil(half_w)) + 1
+		x = np.arange(-n, n + 1)
+		box = np.clip(np.minimum(x + 0.5, half_w) - np.maximum(x - 0.5, -half_w), 0, None)
+		prof = np.convolve(np.asarray(line_profile, dtype=float), box / box.sum())
+		half = prof.max() / 2
+		above = np.where(prof >= half)[0]
+		lo, hi = above[0], above[-1]
+		left = lo - (prof[lo] - half) / (prof[lo] - prof[lo - 1]) if lo > 0 else float(lo)
+		right = hi + (prof[hi] - half) / (prof[hi] - prof[hi + 1]) if hi < prof.size - 1 else float(hi)
+		kms_per_bin = float(self.wave_scale) / self.wavelength * (c / 1000)
+		return float((right - left) * kms_per_bin / (2 * np.sqrt(2 * np.log(2))))
 
 	def load_poly_factors(self,a01, a02, a03, a04, a05, a06, b01, b02, b03, b04, b05, b06, c01, c02, c03, d01):
 		"""
@@ -666,14 +765,15 @@ class Grism:
 		"""
 		Prepare Point Spread Function for grism modeling.
 
-		Oversamples the input PSF to match model resolution, crops to 11x11 pixels
-		(9x9 for factor>1 after oversampling), normalizes, and reshapes for 3D
-		convolution with spectral dimension.
+		Oversamples the input PSF to match model resolution, normalizes, and
+		reshapes for 3D convolution with spectral dimension. The full input
+		stamp is kept (no crop), so its size sets the kernel size.
 
 		Parameters
 		----------
 		PSF : numpy.ndarray or jax.numpy.ndarray
-			2D Point Spread Function at detector resolution
+			2D Point Spread Function at detector resolution, or already at model
+			resolution (detector scale / factor) if self.psf_oversampled is True
 
 		Notes
 		-----
@@ -681,21 +781,26 @@ class Grism:
 		- oversampled_PSF: PSF oversampled by self.factor and normalized
 		- PSF: 3D array with shape (spatial_y, spatial_x, 1) for broadcasting
 
-		If factor=1, uses input PSF directly. Otherwise oversamples using bilinear
-		interpolation and crops to central 11x11 pixels.
+		If factor=1 or psf_oversampled=True, uses input PSF directly. Otherwise
+		oversamples using bilinear interpolation.
 		"""
 		#sets the grism object's oversampled PSF and the velocity space needed for the cube
 		if self.factor == 1:
 			self.oversampled_PSF = PSF
 		else:
-			# self.oversampled_PSF = utils.oversample_PSF(PSF, self.factor)
-			self.oversampled_PSF = utils.oversample(PSF, self.factor, self.factor, method = 'bilinear')
-			# Crop to central 9x9 pixels
-			# For 9x9 input at factor=5, this crops 45x45 -> 9x9
-			crop_half = 4  # Creates 9x9 crop (2*4+1)
-			if self.oversampled_PSF.shape[0] > 2*crop_half + 1:
-				center = self.oversampled_PSF.shape[0]//2
-				self.oversampled_PSF = self.oversampled_PSF[center - crop_half:center + crop_half + 1, center - crop_half:center + crop_half + 1]
+			if self.psf_oversampled:
+				# Already at model resolution (e.g. STPSF OVERDIST at oversample=factor): this is
+				# the optical PSF before pixel integration, so use it as-is. The detector pixel
+				# response is applied once, when the model is binned to detector pixels.
+				self.oversampled_PSF = jnp.asarray(PSF)
+			else:
+				# Detector-pixel PSF (e.g. empirical mosaic PSF): interpolate to model resolution.
+				# Note such a PSF already contains the pixel response, which the binning to
+				# detector pixels then applies a second time.
+				self.oversampled_PSF = utils.oversample(PSF, self.factor, self.factor, method = 'bilinear')
+			# No crop: the input PSF is already cut to its detector-pixel stamp (e.g. 15x15),
+			# so the oversampled kernel keeps all of it. The previous 9x9 model-pixel crop
+			# (1.8 detector px at factor=5) kept only ~25-30% of the PSF flux.
 			#normalize the PSF to sum = 1
 			self.oversampled_PSF = self.oversampled_PSF/jnp.sum(self.oversampled_PSF)
 			# Diagnostic: report effective PSF FWHM in model pixels
@@ -711,22 +816,41 @@ class Grism:
 		# plt.colorbar()
 		# plt.show()
 		self.PSF =  self.oversampled_PSF[:,:, jnp.newaxis]
+		self._set_dispersed_psf()
 
 		# self.full_kernel = jnp.array(self.PSF) * self.lsf_kernel
 
 	
+	def set_model_psf(self, psf):
+		"""
+		Replace the PSF with one already at model resolution (normalised here) and
+		rebuild everything derived from it (dispersed_PSF, sigma_inst_kms). Use this
+		instead of assigning oversampled_PSF / PSF directly, which disperse() would
+		not see.
+		"""
+		psf = jnp.asarray(psf, dtype=float)
+		self.oversampled_PSF = psf / jnp.sum(psf)
+		self.PSF = self.oversampled_PSF[:, :, jnp.newaxis]
+		self._set_dispersed_psf()
+
 	def disperse(self, F, V, D, use_lsf=True):
 		"""
 		Disperse a 3D data cube (flux, velocity, dispersion) through the grism.
 
-		Forward models the grism spectroscopy by:
-		1. Shifting wavelengths based on velocity field
-		2. Broadening by velocity dispersion
-		3. Convolving with 2D spatial PSF in 3D cube space
-		4. Collapsing to 2D grism spectrum
+		Forward model of the grism spectrum:
+		1. Build a (y, x, lambda) cube with each pixel's line at its detector
+		   wavelength: Doppler shift from V plus the pixel's continuous dispersion
+		   offset (wave_array), broadened by D
+		2. Sum along the dispersion axis -> (cross-dispersion, wavelength) image
+		3. Convolve once with the PSF re-gridded onto wavelength bins along its
+		   dispersion axis (dispersed_PSF, see _set_dispersed_psf)
 
-		The 2D PSF handles spectral broadening in the dispersion direction;
-		no separate LSF term is applied (the empirical LSF is PSF-dominated).
+		This equals applying the 2D PSF to every wavelength slice before dispersing
+		(flux the PSF moves by dx along the dispersion axis lands a*dx bins away, so
+		the PSF's dispersion-axis profile broadens the line), for a trace that is
+		linear over the PSF footprint, and is ~8x faster than the 3D convolution. No
+		separate LSF term is applied by default (use_lsf=False): the empirical LSF is
+		PSF-dominated.
 
 		Parameters
 		----------
@@ -760,7 +884,7 @@ class Grism:
 		J_min = self.index_min
 		J_max = self.index_max
 
-		#self.wave_array contains the wavelength of each pixel in the grism image, in the ref frame of the central pixel
+		#detector wavelength of each pixel (in the frame of the central pixel), incl. its dispersion offset
 		wave_centers = self.wavelength*( V/(c/1000) ) + self.wave_array
 		wave_sigmas = self.wavelength*(D/(c/1000) ) #the velocity dispersion doesn't need to be translated to the ref frame of the central pixel
 
@@ -783,104 +907,12 @@ class Grism:
 		# Use JIT-compiled core for Gaussian computation
 		cube = _disperse_gaussian_core(F, wave_centers, wave_sigmas_eff, wave_space_edges)
 
-		# Apply spatial PSF convolution (skip when self.use_psf is False)
+		# Collapse along the dispersion axis -> (cross-dispersion, n_wavelengths)
+		grism_full = jnp.sum(cube, axis=1 if self.pupil == 'R' else 0)
+
+		# PSF, applied once to the collapsed image with the kernel stretched along wavelength
 		if self.use_psf:
-			psf_cube = fftconvolve(cube, self.PSF, mode='same')
-		else:
-			psf_cube = cube
-
-		# Collapse along appropriate axis based on dispersion direction
-		if self.pupil == 'R':
-			# Row dispersion: collapse along x axis (sum over spatial columns)
-			# Output shape: (spatial_y, n_wavelengths)
-			grism_full = jnp.sum(psf_cube, axis=1)
-		elif self.pupil == 'C':
-			# Column dispersion: collapse along y axis (sum over spatial rows)
-			# Output shape: (spatial_x, n_wavelengths)
-			grism_full = jnp.sum(psf_cube, axis=0)
-
-		return grism_full
-
-	def disperse_2d_psf(self, F, V, D, use_lsf=True):
-		"""
-		Disperse a 3D data cube with PSF convolution AFTER 2D projection.
-
-		Alternative forward modeling approach that:
-		1. Shifts wavelengths based on velocity field
-		2. Broadens by velocity dispersion and LSF
-		3. Collapses to 2D grism spectrum first
-		4. Convolves with 2D PSF treating grism image as 2D detector image
-
-		Parameters
-		----------
-		F : jax.numpy.ndarray
-			2D flux map (spatial y, spatial x)
-		V : jax.numpy.ndarray
-			2D velocity field in km/s (spatial y, spatial x)
-		D : jax.numpy.ndarray
-			2D velocity dispersion field in km/s (spatial y, spatial x)
-		use_lsf : bool, optional
-			If True, include LSF broadening (default: True)
-
-		Returns
-		-------
-		jax.numpy.ndarray
-			2D dispersed grism spectrum
-			- For R (row) dispersion: shape (spatial_y, n_wavelengths)
-			- For C (column) dispersion: shape (spatial_x, n_wavelengths)
-
-		Notes
-		-----
-		This method differs from disperse() in the order of operations:
-		- disperse(): PSF convolution in 3D cube space → collapse to 2D
-		- disperse_2d_psf(): collapse to 2D → PSF convolution on 2D detector image
-
-		The grism detector image (spatial, wavelength) is convolved with the
-		2D PSF as if it were a regular 2D image on the detector.
-		"""
-
-		J_min = self.index_min
-		J_max = self.index_max
-
-		#self.wave_array contains the wavelength of each pixel in the grism image, in the ref frame of the central pixel
-		wave_centers = self.wavelength*( V/(c/1000) ) + self.wave_array
-		wave_sigmas = self.wavelength*(D/(c/1000) ) #the velocity dispersion doesn't need to be translated to the ref frame of the central pixel
-
-		#set the effective dispersion which also accounts for the LSF
-		if use_lsf:
-			sigma_LSF = self.sigma_lsf
-			wave_sigmas_eff = jnp.sqrt(jnp.square(wave_sigmas) + jnp.square(sigma_LSF))
-		else:
-			wave_sigmas_eff = wave_sigmas
-
-		#make a 3D cube (spacial, spectral, wavelengths)
-		mu = wave_centers[:,:,jnp.newaxis]
-		sigma = wave_sigmas_eff[:,:,jnp.newaxis]
-
-		#compute the edges of the wave space in order to evaluate the gaussian at those points - focusing only on the region of interest
-		wave_space_crop = self.wave_space[J_min:J_max]
-		wave_space_edges_prov= wave_space_crop[1:] - jnp.diff(wave_space_crop)/2
-		wave_space_edges_prov2 = jnp.insert(wave_space_edges_prov, 0, wave_space_edges_prov[0] - jnp.diff(wave_space_crop)[0])
-		wave_space_edges = jnp.append(wave_space_edges_prov2, wave_space_edges_prov2[-1] + jnp.diff(wave_space_crop)[-1])
-
-
-		# Use JIT-compiled core for Gaussian computation
-		cube = _disperse_gaussian_core(F, wave_centers, wave_sigmas_eff, wave_space_edges)
-
-		# Collapse to 2D BEFORE PSF convolution
-		if self.pupil == 'R':
-			# Row dispersion: collapse along x axis (sum over spatial columns)
-			# Output shape: (spatial_y, n_wavelengths)
-			grism_2d = jnp.sum(cube, axis=1)
-		elif self.pupil == 'C':
-			# Column dispersion: collapse along y axis (sum over spatial rows)
-			# Output shape: (spatial_x, n_wavelengths)
-			grism_2d = jnp.sum(cube, axis=0)
-
-		# Convolve the 2D grism image with the 2D PSF
-		# Treating the (spatial, wavelength) grism image as a 2D detector image
-		psf_2d = self.oversampled_PSF
-		grism_full = fftconvolve(grism_2d, psf_2d, mode='same')
+			grism_full = _spatial_fftconvolve_same(grism_full[:, :, jnp.newaxis], self.dispersed_PSF)[:, :, 0]
 
 		return grism_full
 
