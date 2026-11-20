@@ -143,6 +143,73 @@ class SersicMorphology(MorphologyModel):
                                   (90.0 - PA_morph) * jnp.pi / 180.0)
 
 
+class EdgeDisk(MorphologyModel):
+    """
+    Parametric edge-on sech^2 disk morphology model.
+    van der Kruit & Searle (1981) showed that an edge-on (i=90 radially exponential (n=1) disk can be described by
+
+    I(R, h) = I_0 ⋅ R / Rd ⋅ K_1(R / R_d) ⋅ sech^2(h / h_0)
+
+    where I_0 is the central density,
+    K_1 is the modified Bessel function of the second kind of order one,
+    R_d is the exponential scale length in the disk plane, and
+    h_0 is the scale height
+
+    """
+    _DEFAULT_PARAMETERS = [
+        ParameterSpec("r_scale", r"$R_d$", r"$R_d$", "Uniform"),
+        ParameterSpec("h_scale", r"$h_0$", r"$h_0$", "Uniform"),
+        ParameterSpec("amplitude", r"$A$", r"$A$", "TruncatedNormal"),
+        ParameterSpec('xc_morph', r'$x_0$ [px]', r'$x_0$', 'Normal'),
+        ParameterSpec('yc_morph', r'$y_0$ [px]', r'$y_0$', 'Normal'),
+        ParameterSpec('PA_morph', r'PA$_{\rm morph}$ [deg]', r'PA$_{\rm morph}$', 'Normal'),
+    ]
+
+    def adjust_for_observation(self, morph_params: dict, theta_rot_deg: float, center: float) -> dict:
+        """Rotate PA_morph and centroids into this observation's frame."""
+        theta_rad = jnp.radians(theta_rot_deg)
+        obs_params = dict(morph_params)
+        obs_params['PA_morph'] = morph_params['PA_morph'] - theta_rot_deg
+        xc_obs, yc_obs = utils.rotate_coords(
+            morph_params['xc_morph'], morph_params['yc_morph'],
+            center, center, theta_rad,
+        )
+        obs_params['xc_morph'] = xc_obs
+        obs_params['yc_morph'] = yc_obs
+        return obs_params
+
+    def generate_flux_map(self, morph_params: dict, shared_params: dict, image_shape: int, factor: int) -> jnp.ndarray:
+        from jax.scipy.special import kn  # not implemented for jax<0.12.1
+
+        amplitude = morph_params['amplitude']
+        r_scale = morph_params['r_scale']
+        h_scale = morph_params['h_scale']
+        xc_morph = morph_params['xc_morph']
+        yc_morph = morph_params['yc_morph']
+        PA_morph = morph_params['PA_morph']  # degrees
+
+        x_grid = jnp.linspace(0 - xc_morph, image_shape - xc_morph - 1, image_shape * factor)
+        y_grid = jnp.linspace(0 - yc_morph, image_shape - yc_morph - 1, image_shape * factor)
+        x_grid, y_grid = jnp.meshgrid(x_grid, y_grid)
+        c, s = jnp.cos(jnp.radians(PA_morph)), jnp.sin(jnp.radians(PA_morph))
+        rotation = jnp.array([[c, -s], [s, c]])
+        r, h = jnp.einsum("ij,jhw->ihw", rotation, jnp.stack([x_grid, y_grid], axis=0))
+
+        u = jnp.maximum(jnp.abs(r) / r_scale, 1e-10)
+        model_image = amplitude * u * kn(1, u) / jnp.cosh(h / h_scale) ** 2
+        return model_image
+
+    def sample(self) -> dict:
+        return self._sample()
+
+    def sample_without_amplitude(self) -> dict:
+        """Sample all parameters except amplitude (used in multi-obs fitting)."""
+        from .param_spec import sample_specs
+        specs = [s for s in self.parameters if s.name != 'amplitude']
+        return sample_specs(specs)
+
+
 MORPH_REGISTRY = {
     'Sersic': SersicMorphology,
+    'EdgeDisk': EdgeDisk,
 }
