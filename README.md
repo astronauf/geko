@@ -102,12 +102,13 @@ pip install -e .
 
 ### Requirements
 
-- Python >= 3.8
+- Python >= 3.12
 - JAX/JAXlib (with optional GPU support — see the [JAX installation guide](https://jax.readthedocs.io/en/latest/installation.html))
 - Numpyro
 - Astropy
 - Photutils
 - PySersic
+- JAX-cosmo (> 0.1.0, or a version that replaces `pkg_resources`, unreleased as of 2026/11/20)
 
 ---
 
