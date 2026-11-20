@@ -386,7 +386,7 @@ def plot_disk_summary(obs_map, model_map, obs_error, model_velocities, model_dis
 		Rotation velocity at effective radius
 	fluxes_mean : numpy.ndarray
 		Mean flux values from MCMC
-	inf_data : arviz.InferenceData
+	inf_data : xarray.DataTree
 		MCMC inference results
 	wave_space : numpy.ndarray
 		Wavelength array
@@ -810,7 +810,7 @@ def plot_disk_summary_multi(observations, results, inf_data, wave_space, x0=31, 
 		- 'model_velocities_low': downsampled velocity field
 		- 'model_dispersions_low': downsampled dispersion field
 		- 'fluxes_mean': flux map
-	inf_data : arviz.InferenceData
+	inf_data : xarray.DataTree
 		MCMC inference results
 	wave_space : numpy.ndarray
 		Wavelength array
@@ -1293,7 +1293,7 @@ def plot_multi_obs_comparison_cornerplot(inf_data_list, run_labels, colors, save
 
 	Parameters
 	----------
-	inf_data_list : list of arviz.InferenceData
+	inf_data_list : list of xarray.DataTree
 		One entry per run, in the order they should be plotted.
 	run_labels : list of str
 		Display name for each run (e.g. ['R', 'C', 'Joint']).

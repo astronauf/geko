@@ -53,6 +53,12 @@ from astropy.cosmology import Planck18 as cosmo
 # setup.configure_plots()
 
 
+def _from_numpyro(mcmc, prior):
+    # Predictive returns (draw, ...). ArviZ expects (chain, draw, ...) at every site.
+    prior = {name: samples[None, ...] for name, samples in prior.items()}
+    return az.from_numpyro(mcmc, prior=prior, log_likelihood=True)
+
+
 class Fit_Numpyro():
     def __init__(self, obs_map, obs_error, grism_object, kin_model, inference_data, parametric, config=None):
         """ Class to fit model to data
@@ -67,7 +73,7 @@ class Fit_Numpyro():
                             Grism dispersion object
                         kin_model : KinModels
                             Kinematic model object
-                        inference_data : arviz.InferenceData or None
+                        inference_data : xarray.DataTree or None
                             Previous inference results
                         parametric : bool
                             Whether to use parametric morphology
@@ -582,7 +588,7 @@ def run_geko_fit(output, master_cat, line, parametric, save_runs_path, num_chain
 
     Returns
     -------
-    arviz.InferenceData
+    xarray.DataTree
         MCMC inference results
     """
 
@@ -715,7 +721,7 @@ def run_geko_fit(output, master_cat, line, parametric, save_runs_path, num_chain
     run_fit.run_inference(num_samples=num_samples, num_warmup=num_warmup, high_res=True,
                               median=True, adapt_step_size=True, num_chains=num_chains)
 
-    inf_data = az.from_numpyro(run_fit.mcmc, prior=prior)
+    inf_data = _from_numpyro(run_fit.mcmc, prior)
 
     # Save results
     inf_data.to_netcdf(save_runs_path + output + '/' + str(source_id) + '_output')
@@ -804,7 +810,7 @@ def run_geko_fit_multi(observations_config, output, master_cat, line, parametric
 
     Returns
     -------
-    arviz.InferenceData
+    xarray.DataTree
         MCMC inference results with posterior samples
     dict
         Dictionary mapping observation names to their model predictions, including:
@@ -1015,8 +1021,8 @@ def run_geko_fit_multi(observations_config, output, master_cat, line, parametric
         target_accept_prob=target_accept_prob
     )
 
-    # Convert to arviz InferenceData
-    inf_data = az.from_numpyro(run_fit.mcmc, prior=prior)
+    # Convert to xarray DataTree
+    inf_data = _from_numpyro(run_fit.mcmc, prior)
 
     # Save results
     output_file = save_runs_path + output + '/' + str(source_id) + '_output_multi'
@@ -1199,7 +1205,7 @@ def postprocess_geko_fit_multi(observations_config, output, master_cat, line, pa
 
     output_file = save_runs_path + output + '/' + str(source_id) + '_output_multi'
     print(f"\nLoading existing posterior from: {output_file}")
-    inf_data = az.InferenceData.from_netcdf(output_file)
+    inf_data = az.from_netcdf(output_file)
 
     print("\nComputing model results for each observation...")
     inf_data, results = kin_model.compute_model_parametric_multi(inf_data, observations)

@@ -182,7 +182,7 @@ If you don't have PySersic fits, you must provide complete morphological priors:
 Understanding Results
 ---------------------
 
-The ``inference_data`` object is an ArviZ InferenceData object containing MCMC posterior samples.
+The ``inference_data`` object is an xarray DataTree containing MCMC posterior samples.
 
 Key Parameters
 ^^^^^^^^^^^^^^
@@ -210,7 +210,7 @@ Accessing Results
    import arviz as az
 
    # Get summary statistics (median, std, HDI)
-   summary = az.summary(inference_data, hdi_prob=0.68)
+   summary = az.summary(inference_data, ci_prob=0.68, ci_kind="hdi")
    print(summary)
 
    # Access specific parameter samples
@@ -227,7 +227,7 @@ Geko saves several files in ``<save_runs_path>/<output_name>/``. **All output fi
 
 1. **<source_id>_output** - NetCDF file with full MCMC posterior and prior samples
 
-   Load with: ``az.InferenceData.from_netcdf()``
+   Load with: ``az.from_netcdf()``
 
 2. **<source_id>_results** - ASCII table with summary statistics
 
@@ -258,7 +258,7 @@ Example: Loading Saved Results
    output_dir = os.path.join(save_runs_path, output_name)
 
    # Load inference data
-   inference_data = az.InferenceData.from_netcdf(
+   inference_data = az.from_netcdf(
        os.path.join(output_dir, f'{source_id}_output')
    )
 

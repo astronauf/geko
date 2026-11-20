@@ -23,7 +23,7 @@ def fit_galaxy(data_path, config, **kwargs):
     
     Returns
     -------
-    arviz.InferenceData
+    xarray.DataTree
         MCMC inference results
     """
     from .fitting import Fit_Numpyro

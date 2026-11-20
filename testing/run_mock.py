@@ -6,7 +6,7 @@ from geko import utils
 from geko import plotting
 from geko import models
 
-from geko.fitting import Fit_Numpyro
+from geko.fitting import Fit_Numpyro, _from_numpyro
 from geko.config import FitConfiguration, MCMCSettings
 from geko.postprocess import compute_derived_posterior, summarize_posterior, DERIVED_QUANTITIES
 from geko.param_spec import _apply_overrides_to_specs, all_param_specs
@@ -532,7 +532,7 @@ def run_fit(mock_params, fit_config, parametric=False):
 	                          target_accept_prob=target_accept_prob, num_chains=num_chains,
 	                          init_vals=None, mask=mask)
 
-	inf_data = az.from_numpyro(run_fit_obj.mcmc, prior=prior)
+	inf_data = _from_numpyro(run_fit_obj.mcmc, prior)
 
 	return inf_data, kin_model, grism_object, num_samples, z_spec
 
@@ -752,8 +752,8 @@ def run_test(test, j, config_path, parametric, PA_image, PA_grism, i, sigma0,
 	# Derived quantities (v_sigma, v_circ, M_dyn) already added by save_results
 	try:
 		trace_var_names = [v for v in _var_names if v in inf_data.posterior]
-		az.plot_trace(inf_data, var_names=trace_var_names, divergences=True)
-		plt.savefig('testing/' + save_folder + '/' + str(j) + '_chains.png', dpi=500)
+		trace = az.plot_trace_dist(inf_data, var_names=trace_var_names)
+		trace.savefig('testing/' + save_folder + '/' + str(j) + '_chains.png', dpi=500)
 		plt.show()
 		plt.close('all')
 		kin_model.plot_summary(grism_spectrum_noise, grism_error, inf_data,

@@ -168,7 +168,7 @@ def compute_information_gain(inf_data, param_names=None):
 
 	Parameters
 	----------
-	inf_data : arviz.InferenceData
+	inf_data : xarray.DataTree
 		Must contain both 'posterior' and 'prior' groups.
 	param_names : list of str, optional
 		Parameters to compute. Defaults to all variables present in both groups.
@@ -385,11 +385,11 @@ def process_results(output, master_cat, line, mock_params=None, test=None,
 			manual_psf_name=manual_psf_name, manual_grism_file=manual_grism_file)
 
 	if mock_params is None:
-		inf_data = az.InferenceData.from_netcdf(
+		inf_data = az.from_netcdf(
 			save_runs_path + output + '/' + str(ID) + '_output')
 		j = 0
 	else:
-		inf_data = az.InferenceData.from_netcdf(
+		inf_data = az.from_netcdf(
 			'testing/' + str(test) + '/' + str(test) + '_' + str(j) + '_output')
 
 	# Save S/N mask image (once, for diagnostics)
@@ -462,7 +462,7 @@ def process_results_multi(observations, results, output, master_cat, line,
 	"""Post-process multi-observation inference data and save all outputs."""
 	from . import plotting
 
-	inf_data = az.InferenceData.from_netcdf(
+	inf_data = az.from_netcdf(
 		save_runs_path + output + '/' + str(ID) + '_output_multi')
 
 	z_spec, wavelength, wave_space_ref, obs_map_ref, obs_error_ref, kin_model, \
@@ -517,7 +517,7 @@ def process_results_multi(observations, results, output, master_cat, line,
 		obs_labels = []
 		for obs in observations:
 			obs_path = save_runs_path + str(ID) + '/' + obs.name + '/' + str(ID) + '_output'
-			individual_inf_data.append(az.InferenceData.from_netcdf(obs_path))
+			individual_inf_data.append(az.from_netcdf(obs_path))
 			obs_labels.append(obs.name)
 
 		all_inf_data = individual_inf_data + [inf_data]
@@ -551,6 +551,6 @@ parser.add_argument('--master_cat', type=str,
 
 if __name__ == "__main__":
 	args = parser.parse_args()
-	inf_data = az.InferenceData.from_netcdf(
+	inf_data = az.from_netcdf(
 		'fitting_results/' + args.output + '/output')
 	process_results(args.output, args.master_cat, args.line)

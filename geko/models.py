@@ -969,14 +969,14 @@ class GrismFitter(KinModels):
 
 		Parameters
 		----------
-		inference_data : arviz.InferenceData
+		inference_data : xarray.DataTree
 			MCMC results from multi-observation fit
 		observations : list of GrismObservation
 			List of observations that were fit
 
 		Returns
 		-------
-		inference_data : arviz.InferenceData
+		inference_data : xarray.DataTree
 			Updated inference data
 		results : dict
 			Dictionary with keys being observation names, values being dicts with:
